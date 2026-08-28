@@ -6,7 +6,7 @@ mkdir -p data outputs
 python -m pip install -q --upgrade pip
 python -m pip install -q gdown pandas requests
 
-QUESTIONS_ID="1y524i-A8eUaPgsPcnA0Y2m6wF5sMLZ8"
+QUESTIONS_ID="1y524i-A8eUaPgsPcnA0yT2m6wF5sMLZ8"
 QUESTIONS="data/sf20k_public_test_questions.csv"
 
 if [[ ! -s "$QUESTIONS" ]]; then
