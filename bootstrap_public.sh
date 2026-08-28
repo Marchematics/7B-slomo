@@ -11,7 +11,8 @@ QUESTIONS="data/sf20k_public_test_questions.csv"
 
 if [[ ! -s "$QUESTIONS" ]]; then
   echo "[1/2] Downloading SF20K 2026 public questions from Google Drive..."
-  gdown --id "$QUESTIONS_ID" -O "$QUESTIONS"
+  # Newer gdown releases take the file ID as the positional argument; --id was removed.
+  python -m gdown "$QUESTIONS_ID" -O "$QUESTIONS"
 else
   echo "[1/2] Questions already present: $QUESTIONS"
 fi
