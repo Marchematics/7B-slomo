@@ -4,7 +4,7 @@ from collections import defaultdict
 
 DEFAULT_ENDPOINT = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
 
-SYSTEM = """You answer questions about one long movie. Use only evidence from the supplied video. Answer every question concisely and literally. Preserve names, numbers, places, temporal order, causes, and negation. Do not explain unless the question requires it. Return ONLY valid JSON: an array of objects with keys question_id and prediction. Exactly one object per requested question, in the same order. Never omit a question."""
+SYSTEM = """You answer questions about one long movie. Use only evidence from the supplied video, including its audio. Answer every question concisely and literally. Preserve names, numbers, places, temporal order, causes, and negation. Do not explain unless the question requires it. Return ONLY valid JSON: an array of objects with keys question_id and prediction. Exactly one object per requested question, in the same order. Never omit a question."""
 
 
 def post_json(url, key, payload, timeout=300):
@@ -16,6 +16,44 @@ def post_json(url, key, payload, timeout=300):
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"HTTP {e.code}: {body[:4000]}")
+
+
+def post_stream_json(url, key, payload, timeout=900):
+    """Read an OpenAI-compatible SSE stream and concatenate assistant text."""
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method="POST", headers={
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream",
+    })
+    parts = []
+    usage = None
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            for raw in r:
+                line = raw.decode("utf-8", errors="replace").strip()
+                if not line or not line.startswith("data:"):
+                    continue
+                text = line[5:].strip()
+                if text == "[DONE]":
+                    break
+                try:
+                    obj = json.loads(text)
+                except json.JSONDecodeError:
+                    continue
+                if obj.get("usage"):
+                    usage = obj["usage"]
+                choices = obj.get("choices") or []
+                if not choices:
+                    continue
+                delta = choices[0].get("delta") or {}
+                content = delta.get("content")
+                if isinstance(content, str):
+                    parts.append(content)
+        return "".join(parts), usage
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"HTTP {e.code}: {body[:4000]}")
@@ -37,7 +75,7 @@ def extract_json_array(text):
     a, b = text.find("["), text.rfind("]")
     if a >= 0 and b > a:
         return json.loads(text[a:b+1])
-    raise ValueError("No JSON array found in model output")
+    raise ValueError(f"No JSON array found in model output: {text[:1000]}")
 
 
 def load_questions(path):
@@ -79,16 +117,44 @@ def load_existing(path):
     return out
 
 
+def build_payload(model, video_url, prompt, temperature, max_tokens, fps):
+    # Qwen-Omni uses streaming only and can consume both video and its audio.
+    # For VL models, fps is a sibling of video_url according to the OpenAI-compatible API.
+    video_item = {"type": "video_url", "video_url": {"url": video_url}}
+    if "omni" not in model.lower() and fps is not None:
+        video_item["fps"] = fps
+
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": SYSTEM},
+            {"role": "user", "content": [
+                video_item,
+                {"type": "text", "text": prompt},
+            ]},
+        ],
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+    if "omni" in model.lower():
+        payload.update({
+            "modalities": ["text"],
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        })
+    return payload
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--questions", required=True)
-    ap.add_argument("--output", default="outputs/special_qwen3vl4b.csv")
-    ap.add_argument("--model", default="qwen3-vl-4b-instruct")
+    ap.add_argument("--output", default="outputs/special_qwen25omni7b.csv")
+    ap.add_argument("--model", default="qwen2.5-omni-7b")
     ap.add_argument("--endpoint", default=os.getenv("DASHSCOPE_ENDPOINT", DEFAULT_ENDPOINT))
-    ap.add_argument("--fps", type=float, default=0.2)
-    ap.add_argument("--max-tokens", type=int, default=2200)
-    ap.add_argument("--temperature", type=float, default=0.0)
-    ap.add_argument("--retries", type=int, default=5)
+    ap.add_argument("--fps", type=float, default=0.2, help="Used for VL models; Omni controls its own A/V sampling")
+    ap.add_argument("--max-tokens", type=int, default=1800)
+    ap.add_argument("--temperature", type=float, default=0.01)
+    ap.add_argument("--retries", type=int, default=3)
     ap.add_argument("--limit-movies", type=int, default=0)
     args = ap.parse_args()
 
@@ -118,24 +184,17 @@ def main():
 
         qtext = "\n".join(f'{i+1}. [{x["question_id"]}] {x["question"]}' for i, x in enumerate(qs))
         prompt = f"Movie questions ({len(qs)} total):\n{qtext}\n\nReturn exactly {len(qs)} JSON objects. Predictions should usually be short noun phrases or short sentences, not explanations."
-        payload = {
-            "model": args.model,
-            "messages": [
-                {"role": "system", "content": SYSTEM},
-                {"role": "user", "content": [
-                    {"type": "video_url", "video_url": {"url": video_url, "fps": args.fps}},
-                    {"type": "text", "text": prompt},
-                ]},
-            ],
-            "temperature": args.temperature,
-            "max_tokens": args.max_tokens,
-        }
+        payload = build_payload(args.model, video_url, prompt, args.temperature, args.max_tokens, args.fps)
 
         last_err = None
         for attempt in range(args.retries):
             try:
-                resp = post_json(args.endpoint, key, payload)
-                text = resp["choices"][0]["message"]["content"]
+                if payload.get("stream"):
+                    text, usage = post_stream_json(args.endpoint, key, payload)
+                else:
+                    resp = post_json(args.endpoint, key, payload)
+                    text = resp["choices"][0]["message"]["content"]
+                    usage = resp.get("usage")
                 arr = extract_json_array(text)
                 got = {}
                 for item in arr:
@@ -151,12 +210,12 @@ def main():
                 preds.update(got)
                 write_csv(args.output, order, preds)
                 done_movies += 1
-                print(f"OK {vid}: +{len(got)} total={len(preds)}/{len(rows)}")
+                print(f"OK {vid}: +{len(got)} total={len(preds)}/{len(rows)} usage={usage}")
                 last_err = None
                 break
             except Exception as e:
                 last_err = e
-                delay = min(30, 2 ** attempt)
+                delay = min(10, 2 ** attempt)
                 print(f"ERR {vid} attempt={attempt+1}/{args.retries}: {e}")
                 time.sleep(delay)
         if last_err is not None:
