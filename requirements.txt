@@ -1,1 +1,7 @@
 requests
+pandas
+dashscope
+opencv-python-headless
+numpy
+Pillow
+yt-dlp
